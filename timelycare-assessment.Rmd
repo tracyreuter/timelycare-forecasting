@@ -1,0 +1,253 @@
+---
+title: "TimelyCare Assesment"
+author: "Tracy Reuter"
+output: pdf_document
+---
+
+# Question 1 (SQL code)
+**We're noticing a data quality issue and want you to investigate. What's the total number of visits that cannot occur because the provider was double-booked at the same time? What is the total count that can not continue because the provider didn't have a valid license in the member's state?**
+
+```{r}
+# -- written in TSQL but translatable to MySQL
+# -- 1. identify double-booked appointments
+# select
+# scheduled_date_time,
+# provider_id,
+# count(distinct(member_id)) as n_patients
+# from DB.schema.visit_table
+# group by
+# scheduled_date_time,
+# provider_id
+# -- same provider, same time, > 1 patient
+# having count(distinct(member_id)) >1;
+# 
+# -- 2. identify invalid licenses
+# select
+# vis.provider_id,
+# vis.scheduled_date_time
+# from DB.schema.visit_table as vis
+# left join DB.schema.member_table as mem on vis.member_id = mem.id
+# left join DB.schema.provider_table as prov on vis.provider_id = prov.id
+# where
+# -- if provider license state does not match visit state, the license is invalid
+# prov.License not like '%' + mem.visit_state + '%' 
+# -- assuming service_line HC means license valid in all states (* notation)
+# and vis.service_line not in ('HC');
+```
+\newpage
+
+# Question 2 (R code)
+**We're noticing a data quality issue and want you to investigate. What's the total number of visits that cannot occur because the provider was double-booked at the same time? What is the total count that can not continue because the provider didn't have a valid license in the member's state?**
+
+- I assumed "double-booked" means that 1 provider had 2 patients scheduled for the same time (i.e. not counting partial overlaps).
+
+- I assumed "valid license" means that the member state matches provider license state *and* service_line matches license type *and* license active is "true" *or* service_line is "HC" (which might indicate MD or other license that is valid in all states).
+```{r, echo=F, warning=F, message=F, fig.align='center'}
+rm(list=ls(all=T))
+setwd("~/Library/CloudStorage/Dropbox/Portfolio/timelycare-forecasting")
+library(knitr)
+library(dplyr)
+library(readxl)
+visits = read_excel('ds_assessment_2023.xlsx', sheet = 'visit_table')
+members = read_excel('ds_assessment_2023.xlsx', sheet = 'member_table')
+providers = read_excel('ds_assessment_2023.xlsx', sheet = 'provider_table')
+colnames(visits)[1:1] <- c('visit_id')
+colnames(members)[1:1] <- c('member_id')
+colnames(providers)[1:1] <- c('provider_id')
+colnames(visits) <- tolower(colnames(visits))
+colnames(members) <- tolower(colnames(members))
+colnames(providers) <- tolower(colnames(providers))
+# 1. identify double-booked visits
+ds <- group_by(visits, scheduled_date_time, provider_id) %>%
+  summarise(n_patients = length(unique(member_id))) %>%
+  filter(n_patients > 1)
+ds <- select(ds, provider_id, scheduled_date_time)
+kable(ds, format = 'markdown', caption = "These visits were double-booked.")
+# 2. identify invalid licenses
+ds <- dplyr::left_join(
+  select(visits, visit_id, scheduled_date_time, member_id, provider_id, service_line),
+  select(members, member_id, visit_state),
+  by = join_by(member_id)
+)
+ds <- dplyr::left_join(
+  select_all(ds),
+  select(providers, provider_id, license),
+  by = join_by(provider_id)
+)
+library(tidyverse)
+ds <- ds %>% separate_wider_delim(license, ",", names_sep = "", too_few = "align_start")
+wrangle_license_text <- function(x) {
+  x %>% 
+    gsub("\\{|\\}", "", .) %>%
+    gsub("\\[|\\]", "", .) %>%
+    gsub(":", "", .) %>%
+    gsub("_", "", .) %>%
+    gsub("id","", .) %>%
+    gsub("type","", .) %>%
+    gsub("state","", .) %>%
+    gsub("active","", .) %>%
+    gsub("expdate","", .) %>%
+    gsub(" ", "", .) %>%
+    gsub('"', "", .) %>%
+    gsub("therapy", "THER", .) %>%
+    gsub("[ |\t]+", " ", .)
+}
+ds[,7:21] <- lapply(ds[,7:21], wrangle_license_text)
+colnames(ds)[7:21] <- c('l1_id','l1_type','l1_state','l1_active','l1_expdate',
+                        'l2_id','l2_type','l2_state','l2_active','l2_expdate',
+                        'l3_id','l3_type','l3_state','l3_active','l3_expdate')
+ds <- ds %>% 
+  mutate(valid_license = case_when(
+    visit_state == l1_state & service_line == l1_type & l1_active == "true" ~ 'valid',
+    visit_state == l2_state & service_line == l2_type & l2_active == "true" ~ 'valid',
+    visit_state == l3_state & service_line == l3_type & l3_active == "true" ~ 'valid',
+    service_line == "HC" & l1_type == "HC" & l1_state == "*" ~ 'valid',
+    TRUE ~ 'invalid'))
+ds <- select(ds[ds$valid_license=="invalid",], provider_id, scheduled_date_time)
+kable(ds, format = "markdown", caption = "These visits had an invalid license.")
+```
+\newpage
+
+# Question 3A
+**We are interested in using a forecast of the target variable of "workload" to determine how to best staff for a week. With that in mind, please forecast the "workload" by all forecastable "type" for the next 60 days and provide the accuracy measurements you used to determine the best approach for each.**
+
+## 1. Visualize time series by type and segment
+Thin lines display log-transformed workload per date. (Log transformation is detailed in the below code.) Thick lines display a local regression (loess) which helps to quickly visualize trends over time by fitting a smooth curve through the data points. Workload changes differently over time by type (alpha, beta, charlie, delta) and by segment (1, 2, 3).
+```{r, echo=F, warning=F, message=F, fig.align='center', fig.height=6, fig.width=6}
+setwd("~/Library/CloudStorage/Dropbox/Portfolio/timelycare-forecasting")
+df = read_excel('ds_assessment_2023.xlsx', sheet = 'Table_Forecast')
+colnames(df)[1:1] <- c('date')
+df$date <- date(df$date)
+df$segment <- as.factor(df$segment)
+df$round_date <- round_date(df$date, "month")
+library(ggplot2)
+for (i in sort(unique(df$type))) {
+  print(ggplot(data=df[df$type==i,], aes(x=date, y=log(workload), group = segment, color = segment)) +
+          ggtitle(paste0(c(i)," log workload over time, by segment")) + 
+          theme(plot.title = element_text(lineheight=.8, face="bold")) +
+          facet_wrap(.~ segment, nrow = 3) +
+          scale_color_manual(values=c("#000000", "#E69F00", "#56B4E9")) +
+          scale_fill_manual(values=c("#000000", "#E69F00", "#56B4E9")) +
+          #geom_point(aes(color = segment), alpha = 0.25) +
+          geom_line(aes(color = segment)) +
+          geom_smooth(formula = 'y ~ x', method = "loess", se = F, linewidth = 1.5, aes(color = segment)) +
+          geom_hline(aes(yintercept=mean(log(df[df$type==i,]$workload)), linetype='mean log workload')) + 
+          scale_y_continuous(name="") +
+          scale_x_date(date_labels = "%m %Y") +
+          theme_bw(base_family = "Times", base_size=12) +
+          theme(panel.grid.minor = element_blank(), 
+                panel.grid.major = element_blank(), 
+                panel.border = element_rect(linewidth = 1, color = "black"), 
+                axis.title.x = element_blank(),
+                legend.position = 'bottom', 
+                legend.title = element_blank()))
+}
+```
+\newpage
+
+## 2. Build time series models and evaluate accuracy
+To forecast future workload, I used ARIMA (auto-regressive incremental moving average) models. To evaluate model accuracy, I used BIC, visualized residuals, and used MAPE (mean absolute percentage error) as a final summary statistic. **Detailed explanations are included throughout the below code.** Given that workload varies significantly by segment, I forecasted workload for each type and each segment independently, building 12 total models.
+
+Table 3 summarizes model results for each type and segment. The train_MAPE value indicates how well the model fit the training data, whereas the validation_MAPE value indicates how well the model fit previously-unseen test data. Smaller MAPE values mean better model accuracy. **Importantly, seeing validation_MAPE on par with train_MAPE means that the model was not over-fit to the training data. Rather, it extended well to new data too.** The forecasted_log_workload gives the mean forecasted log workload for the coming 60 days. (The log value helps to compare with the above visuals.) Finally, the forecasted_workload gives the forecast in the original scale.
+```{r, echo=F, warning=F, message=F, fig.align='center'}
+library(tseries)
+library(forecast)
+model_df <- group_by(df, type, segment) %>%
+  summarise(train_MAPE = NA, # accuracy measure for model training
+            validation_MAPE = NA, # accuracy measure for model validation
+            forecasted_log_workload = NA, # mean forecasted workload (log) for future 60 days
+            forecasted_workload = NA) # mean forecasted workload (original scale) for future 60 days
+build_and_evaluate_models <- function(data) {
+for (i in sort(unique(data$type))) {
+  # subset to each type (alpha, beta, charlie, delta)
+  loop_data <- data[data$type==i,]
+for (j in sort(unique(loop_data$segment))) {
+  # subset to each segment (1, 2, 3) and divide into training and test datasets
+  data_train <- loop_data[loop_data$segment==j & loop_data$date >= "2021-01-01" & loop_data$date <= "2022-05-31",]
+  data_test <- loop_data[loop_data$segment==j & loop_data$date >= "2022-06-01" & loop_data$date <= "2022-07-31",]
+  # log-transform workload to reduce trend impacts
+  data_train <- log(data_train$workload)
+  data_test <- log(data_test$workload)
+  # confirm stationarity with a Dickey Fuller test
+  # mean, variance, and covariance should be constant over time (i.e. predictable!)
+  suppressWarnings(test_result <- adf.test(data_train, alternative = "stationary", k=0))
+  if(test_result$p.value > 0.05) {
+    print(paste0("WARNING: type ", paste0(c(i), " segment ", c(j), " is NOT stationary.")))
+  }
+  # check whether a seasonal model is necessary
+  full_data <- loop_data[loop_data$segment==j, ]
+  full_data <- log(full_data$workload)
+  test_result <- Box.test(full_data, type = "Ljung")
+  if(test_result$p.value < 0.05) {
+    # constrain model selection to seasonal models, see more explanation immediately below
+    trained_model <- auto.arima(data_train, ic = "bic", seasonal = T, stepwise = F, approximation = F, trace = F)
+  } else {
+    # find the model with the lowest BIC (Bayes info criterion, lower BIC indicates better model fit)
+    trained_model <- auto.arima(data_train, ic = "bic", seasonal = F, stepwise = F, approximation = F, trace = F)
+    # p is the order of the AR (auto-regresive) term: the number of lags of Y to be used as predictors
+    # q is the order of the MA (moving average) term: the number of lagged forecast errors
+    # d is the number of differencing steps to make the time series stationary (to remove trend and seasonality)
+  }
+    # 1. assess model performance for data_train via residuals
+    # residual = difference between an observation and its fitted (predicted) value
+    # if a model fits well, we should see normally-distributed residuals, mean = 0, constant variance
+    # seasonality would be visible in AFC (autocorrelation function) patterns
+    # print(checkresiduals(trained_model))
+
+    # 2. summarize model performance for data_train via MAPE (mean absolute percentage error)
+    # average absolute difference between actual and fitted (predicted value)
+    # get fitted values from the model vs. actual values
+    values_fitted <- as.data.frame(fitted(trained_model))
+    values_actual <- as.data.frame(data_train)
+    # calculate MAPE and save to model_df
+    MAPE <- round(mean(abs((values_actual$data_train-values_fitted$x)/values_actual$data_train)) * 100)
+    model_df[model_df$type==i & model_df$segment==j,]$train_MAPE <- MAPE
+    
+    # 3. assess how well the model predicts values for data_test (model validation)
+    test_forecast <- forecast::Arima(data_test, model = trained_model)
+    # get fitted values from the model vs. actual values
+    values_fitted <- as.data.frame(fitted(test_forecast))
+    values_actual <- as.data.frame(data_test)
+    # calculate MAPE and save to model_df
+    MAPE <- round(mean(abs((values_actual$data_test-values_fitted$x)/values_actual$data_test)) * 100)
+    model_df[model_df$type==i & model_df$segment==j,]$validation_MAPE <- MAPE
+    
+    # 4. forecast future workload
+    # build the final model using all the data, following the same steps as above
+    test_result <- Box.test(full_data, type = "Ljung")
+  if(test_result$p.value < 0.05) {
+    final_model <- auto.arima(full_data, ic = "bic", seasonal = T, stepwise = F, approximation = F, trace = F)
+  } else {
+    final_model <- auto.arima(full_data, ic = "bic", seasonal = F, stepwise = F, approximation = F, trace = F)
+  }
+    # forecast future workload (h = number of periods = 60 days)
+    future_forecast <- forecast::forecast(final_model, h=60, level=c(95))
+    future_forecast <- as.data.frame(future_forecast)
+    model_df[model_df$type==i & model_df$segment==j,]$forecasted_log_workload <- round(mean(future_forecast$`Point Forecast`))
+    model_df[model_df$type==i & model_df$segment==j,]$forecasted_workload <- round(mean(exp(future_forecast$`Point Forecast`)))
+  }
+}
+  model_df <<- model_df
+}
+build_and_evaluate_models(data = df)
+kable(model_df, format = "markdown", caption = "Model Summary Statistics")
+```
+\newpage
+
+# Question 3B
+**We are interested in understanding the impact of "segment" on the "workload" forecast. How would you explain the impact the segment has on the overall forecast of "workload"? What "segment" has the most impact on the forecasting of the "workload"?**
+
+Based on the above data visualization and model results, **segment 1** has the most impact for forecasting workload. This segment has rapid growth over time, and model results suggest future workload demand will continue.
+
+# Question 3C
+**Explain any seasonality you have discovered in the data.**
+
+1. As I developed the modeling function, I used a Ljung-Box test and ACF (auto-correlation function) plots to assess seasonality. The following time series had significant seasonality prior to modeling:
+- type alpha, segment 2
+- type beta segment 1, 2, and 3
+- type charlie, segment 1
+- type delta segment 1 and 2
+
+2. The modeling function takes seasonality into account. If the time series had significant seasonality effects, then I directed the ARIMA model selection process to evaluate only seasonal models. Then, selecting the optimal differencing parameter (*d*) is designed to account for seasonality.
+
+3. Having multiple years of data would help to better understand seasonality. Specifically, there is a decrease in workload around January 2022. Assessing data for January 2023 would help to determine whether that was a one-off spike or an annual pattern.
