@@ -1,1 +1,3 @@
-# code and output for TimelyCare data scientist assessment
+# TimelyCare technical assessment
+
+Thank you for your consideration.
